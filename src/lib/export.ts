@@ -51,6 +51,7 @@ export function buildExportSnapshot(
 export interface PositionJson {
   text: string
   pageHeight: number
+  maxWidth: number | null
   positions: Array<{
     index: number
     char: string
@@ -70,6 +71,7 @@ export function layoutToJson(layout: Layout): PositionJson {
   return {
     text: layout.text,
     pageHeight: layout.pageHeight,
+    maxWidth: Number.isFinite(layout.maxWidth) ? layout.maxWidth : null,
     positions: layout.placed.map((p) => ({
       index: p.index,
       char: p.char,

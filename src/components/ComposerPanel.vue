@@ -56,7 +56,7 @@ async function doExport() {
     <label class="text-label">
       输入字串
       <textarea
-        rows="2"
+        rows="4"
         :value="text"
         spellcheck="false"
         @input="emit('update:text', ($event.target as HTMLTextAreaElement).value)"
@@ -93,7 +93,7 @@ async function doExport() {
 
     <div v-if="snapshot" class="result">
       <p class="bbox">最小包围盒：{{ bboxText }}</p>
-      <p class="positions-title">各字形位置（严格递增 x）：</p>
+      <p class="positions-title">各字形位置（同一行内 x 严格递增，换行后从 x=0 起）：</p>
       <ol class="positions">
         <li v-for="p in snapshot.layout.placed" :key="p.index">
           <span class="swatch" :style="{ background: snapshot.layout.palette[p.index] }" />

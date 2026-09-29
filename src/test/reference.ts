@@ -31,12 +31,19 @@ export function blackCells(g: Glyph): Array<[number, number]> {
 
 /**
  * 朴素参考实现：完全按规格用“全局占用格集合”逐黑像素模拟。
- * - 首字 x=0；之后候选从 prevX+1 开始逐个整数；
- * - 每个候选的每个黑像素若落在任一已放字形的黑像素格上即碰撞；
+ * - 每行首字 x=0；之后候选从 prevX+1 开始逐个整数；
+ * - 每个候选的每个黑像素若落在同一行任一已放字形的黑像素格上即碰撞；
+ * - 最早无碰撞候选的整幅外框超出 maxWidth 时换到下一行（x 从 0 重新开始）；
+ * - '\n' 强制换行，连续换行保留空行，空行同样占整行画布高度；
  * - 空白像素不进占用集合，因此允许互相覆盖。
  * 不做任何位运算优化，测试中快速实现（32 位行掩码）必须与此结果一致。
  */
-export function referenceLayout(page: GlyphPage, text: string) {
+export function referenceLayout(
+  page: GlyphPage,
+  rawText: string,
+  maxWidth = Infinity,
+) {
+  const text = rawText.replace(/\r\n?/g, '\n')
   const chars = Array.from(text)
   const byChar = new Map<string, Glyph>()
   const blacks = new Map<string, Array<[number, number]>>()
@@ -46,55 +53,88 @@ export function referenceLayout(page: GlyphPage, text: string) {
   }
 
   const placed: PlacedGlyph[] = []
-  const occupied = new Set<number>() // key = r + gx * (page.height+1) 不安全；改用大因子
-  const KEY_YF = 64 // height ≤ 32，64 保证 key 无碰撞
+  // key = gy + gx * KEY_XF：gy 可达 行数*(H+1) ≤ 81*33 < 2048，取 4096 无碰撞。
+  const occupied = new Set<number>()
+  const KEY_XF = 4096
   let bbox: BBox | null = null
+  let lineIndex = 0
   let prevX = -1
+  let placedInLine = 0
 
-  const collides = (ch: string, x: number) => {
+  const collides = (ch: string, x: number, y: number) => {
     for (const [r, c] of blacks.get(ch)!) {
-      if (occupied.has(r + (x + c) * KEY_YF)) return true
+      if (occupied.has(y + r + (x + c) * KEY_XF)) return true
     }
     return false
   }
 
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i]
+  for (const ch of chars) {
+    if (ch === '\n') {
+      lineIndex++
+      prevX = -1
+      placedInLine = 0
+      continue
+    }
     const g = byChar.get(ch)!
+    // 行顶必须随自动换行重新计算（不能在候选循环外取常量，否则换行后
+    // 碰撞仍查旧行，x=0 永远碰撞 → 死循环）。
+    let y = lineIndex * (page.height + 1)
     let x: number
-    if (i === 0) {
+    if (placedInLine === 0) {
       x = 0
     } else {
       x = prevX + 1
-      while (collides(ch, x)) x++
+      for (;;) {
+        if (!collides(ch, x, y)) {
+          if (Number.isFinite(maxWidth) && x + g.width > maxWidth) {
+            lineIndex++
+            prevX = -1
+            placedInLine = 0
+            x = 0
+            y = lineIndex * (page.height + 1)
+            continue
+          }
+          break
+        }
+        x++
+      }
     }
     placed.push({
-      index: i,
+      index: placed.length,
       char: ch,
       x,
-      y: 0,
+      y,
       width: g.width,
       height: g.height,
     })
+    placedInLine++
     for (const [r, c] of blacks.get(ch)!) {
-      occupied.add(r + (x + c) * KEY_YF)
+      const gy = y + r
+      occupied.add(gy + (x + c) * KEY_XF)
       const gx = x + c
       if (!bbox) {
-        bbox = { minX: gx, minY: r, maxX: gx, maxY: r }
+        bbox = { minX: gx, minY: gy, maxX: gx, maxY: gy }
       } else {
         if (gx < bbox.minX) bbox.minX = gx
         if (gx > bbox.maxX) bbox.maxX = gx
-        if (r < bbox.minY) bbox.minY = r
-        if (r > bbox.maxY) bbox.maxY = r
+        if (gy < bbox.minY) bbox.minY = gy
+        if (gy > bbox.maxY) bbox.maxY = gy
       }
     }
     prevX = x
   }
 
+  // 总行数 = 到达过的最大行次 + 1（自动换行与强制换行都计入）。
+  const lineCount = lineIndex + 1
   return {
     placed,
     bbox,
-    canvasWidth: Math.max(1, ...placed.map((p) => p.x + p.width)),
+    canvasWidth:
+      placed.length === 0
+        ? 1
+        : Math.max(...placed.map((p) => p.x + p.width)),
+    canvasHeight: lineCount * page.height + (lineCount - 1),
+    lineCount,
   }
 }
 

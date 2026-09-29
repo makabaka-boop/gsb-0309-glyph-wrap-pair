@@ -54,6 +54,35 @@ describe('composeLayout 错误处理', () => {
     expect(r.error!.char).toBe('C')
   })
 
+  it('单字外框宽于行宽报 glyph-too-wide 并指出该字符', () => {
+    const wide: GlyphPage = {
+      height: 2,
+      glyphs: [
+        glyph('W', [
+          [1, 0, 1, 0, 1],
+          [1, 1, 1, 1, 1],
+        ]),
+        glyph('B', [
+          [0, 1],
+          [1, 0],
+        ]),
+      ],
+    }
+    const r = composeLayout(wide, 'WB', 4)
+    expect(r.ok).toBe(false)
+    expect(r.error!.kind).toBe('glyph-too-wide')
+    expect(r.error!.char).toBe('W')
+    // 不限宽（仅测试内部调用）时不应报超宽。
+    expect(composeLayout(wide, 'W').ok).toBe(true)
+  })
+
+  it('换行符不是缺失字符；仅换行不算空串', () => {
+    const r = composeLayout(page, 'A\nB')
+    expect(r.ok).toBe(true)
+    const onlyBreaks = composeLayout(page, '\n\n')
+    expect(onlyBreaks.ok).toBe(true)
+  })
+
   it('页面非法时报 invalid-page 并附带问题列表', () => {
     const bad: GlyphPage = {
       height: 2,

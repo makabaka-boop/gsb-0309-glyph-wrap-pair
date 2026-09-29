@@ -84,15 +84,22 @@ function fail(error: ComposeError): ComposeResult {
 /**
  * 离线排版入口。
  *
- * 规则：
- * 1. 首字左边缘 x=0；之后每字左边缘必须严格大于前一字左边缘，
+ * 二维排版规则：
+ * 1. 每行首字左边缘 x=0；之后每字左边缘必须严格大于同一行前一字左边缘，
  *    从 prevX+1 开始逐个整数候选；
- * 2. 候选 x 必须不与“任何已放字形”的黑像素重合（不只是相邻两字）；
- * 3. 空白像素允许互相覆盖，所以只比较黑像素；
- * 4. 缺失字符或页面/位图非法时返回错误，调用方据此撤销旧排版；
- * 5. 全空合成图 bbox=null（对外记为 EMPTY）。
+ * 2. 候选 x 必须不与“同一行任何已放字形”的黑像素重合（不只是相邻两字），
+ *    换行后的字形不参与碰撞比较；
+ * 3. 最早无碰撞候选位置放不下整幅字形外框（x + width > maxWidth）时
+ *    换到下一行（下一行从 x=0 重新开始）；
+ * 4. 输入中的换行符强制换行，连续换行保留空行；
+ * 5. 单字外框比行宽还宽时任何位置都放不下，报 glyph-too-wide 并撤销旧排版；
+ * 6. 缺失字符或页面/位图非法时返回错误，调用方据此撤销旧排版；
+ * 7. 全空合成图 bbox=null（对外记为 EMPTY），但画布仍覆盖全部行与空行。
  */
-export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number): ComposeResult {
+export function composeLayout(page: GlyphPage, rawText: string, maxWidth = Infinity): ComposeResult {
+  // \r\n 与单独的 \r 一律规范化为 \n：换行符不查字形表，
+  // 连续换行保留空行，首尾换行同样占整行画布高度。
+  const text = rawText.replace(/\r\n?/g, '\n')
   const codePoints = Array.from(text)
 
   if (codePoints.length === 0) {
@@ -105,6 +112,11 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
     })
   }
 
+  // maxWidth 为 NaN/undefined 等非法值时按不限宽处理（UI 始终夹到 8~128）。
+  const lineLimit = Number.isFinite(maxWidth)
+    ? Math.max(1, Math.floor(maxWidth as number))
+    : Infinity
+
   const issues = validatePage(page)
   if (issues.length > 0) {
     return fail({
@@ -115,8 +127,9 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
   }
 
   const prepared = prepare(page)
+  // 换行符不是字符，不查字形表；其余码点必须都有对应字形。
   for (const ch of codePoints) {
-    if (!prepared.has(ch)) {
+    if (ch !== '\n' && !prepared.has(ch)) {
       return fail({
         kind: 'missing-char',
         char: ch,
@@ -125,23 +138,57 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
     }
   }
 
+  // 单字外框比整行还宽：任何候选位置都放不下，提前报错，
+  // 避免静默产出超宽画布。
+  if (lineLimit !== Infinity) {
+    for (const ch of codePoints) {
+      const item = prepared.get(ch)
+      if (item && item.glyph.width > lineLimit) {
+        return fail({
+          kind: 'glyph-too-wide',
+          char: ch,
+          message:
+            `字符 "${ch}" 的字形宽 ${item.glyph.width} 超过每行最大宽度 ${lineLimit}，` +
+            '无法排版：请加宽行宽或缩窄该字形，已保留编辑并撤销旧排版',
+        })
+      }
+    }
+  }
+
   const placed: PlacedGlyph[] = []
   let bbox: BBox | null = null
+  // 当前行状态：x 从 0 重新开始；只保留同一行已放字形用于碰撞。
+  let lineIndex = 0
   let prevX = -1
+  let lineStartIdx = 0 // 当前行第一个已放字形在 placed 中的下标
+  let placedInLine = 0
+
+  const lineTop = () => lineIndex * (page.height + 1)
 
   for (let i = 0; i < codePoints.length; i++) {
     const ch = codePoints[i]
+
+    if (ch === '\n') {
+      // 强制换行：下一行从 x=0 开始，即使当前行一个字也没有（空行）。
+      lineIndex++
+      lineStartIdx = placed.length
+      prevX = -1
+      placedInLine = 0
+      continue
+    }
+
     const item = prepared.get(ch)!
     let x: number
-    if (i === 0) {
+    if (placedInLine === 0) {
+      // 行首字（含自动换行后的第一个字）固定 x=0。
       x = 0
     } else {
-      // 候选从 prevX+1 起，一定满足“左边缘严格大于前一字左边缘”。
+      // 候选从 prevX+1 起，一定满足“左边缘严格大于行内前一字左边缘”。
       let candidate = prevX + 1
       for (;;) {
         let collision = false
-        // 与所有已放字形比较，防止隔字碰撞。
-        for (let j = 0; j < placed.length; j++) {
+        // 只与同一行已放字形比较：换行后的字形行号不同，永不碰撞。
+        for (let j = lineStartIdx; j < placed.length; j++) {
           const other = prepared.get(placed[j].char)!
           const dx = candidate - placed[j].x
           if (masksCollide(other.masks, item.masks, dx)) {
@@ -150,6 +197,15 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
           }
         }
         if (!collision) {
+          // 最早无碰撞候选已超出右边界：本行不可能放下，整字移到下一行。
+          if (lineLimit !== Infinity && candidate + item.glyph.width > lineLimit) {
+            lineIndex++
+            lineStartIdx = placed.length
+            prevX = -1
+            placedInLine = 0
+            candidate = 0
+            continue
+          }
           x = candidate
           break
         }
@@ -157,54 +213,60 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
       }
     }
 
+    const y = lineTop()
     placed.push({
-      index: i,
+      index: placed.length,
       char: ch,
       x,
-      y: 0,
+      y,
       width: item.glyph.width,
       height: item.glyph.height,
     })
+    placedInLine++
 
     if (item.colSpan && item.rowSpan) {
       const gMinX = x + item.colSpan.min
       const gMaxX = x + item.colSpan.max
+      const gMinY = y + item.rowSpan.min
+      const gMaxY = y + item.rowSpan.max
       if (bbox === null) {
-        bbox = {
-          minX: gMinX,
-          minY: item.rowSpan.min,
-          maxX: gMaxX,
-          maxY: item.rowSpan.max,
-        }
+        bbox = { minX: gMinX, minY: gMinY, maxX: gMaxX, maxY: gMaxY }
       } else {
         bbox.minX = Math.min(bbox.minX, gMinX)
         bbox.maxX = Math.max(bbox.maxX, gMaxX)
-        bbox.minY = Math.min(bbox.minY, item.rowSpan.min)
-        bbox.maxY = Math.max(bbox.maxY, item.rowSpan.max)
+        bbox.minY = Math.min(bbox.minY, gMinY)
+        bbox.maxY = Math.max(bbox.maxY, gMaxY)
       }
     }
     prevX = x
   }
 
-  // 画布覆盖所有已放字形（含空白部分），保证导出图与布局位置一致。
-  const canvasWidth = Math.max(
-    1,
-    ...placed.map((p) => p.x + p.width),
-  )
+  // 总行数 = 到达过的最大行次 + 1（自动换行与强制换行都计入，
+  // 首尾/连续换行产生的空行同样占整行高度）。
+  const lineCount = lineIndex + 1
+  // 画布覆盖所有已放字形（含空白部分）；没有任何字形（仅换行）时宽度至少 1。
+  const canvasWidth =
+    placed.length === 0
+      ? 1
+      : Math.max(...placed.map((p) => p.x + p.width))
+  // 行间保留一行空白：N 行总高 = N*H + (N-1)。
+  const canvasHeight = lineCount * page.height + (lineCount - 1)
 
   const palette = buildPalette(placed.length)
   const layout: Layout = {
     pageHeight: page.height,
     text,
+    maxWidth: lineLimit === Infinity ? Number.POSITIVE_INFINITY : lineLimit,
     placed,
     bbox,
     canvasWidth,
-    canvasHeight: page.height,
+    canvasHeight,
     palette,
     legend: placed.map((p) => ({
       index: p.index,
       char: p.char,
       x: p.x,
+      y: p.y,
       color: palette[p.index],
     })),
   }

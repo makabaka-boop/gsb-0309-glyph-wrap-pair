@@ -19,18 +19,29 @@ describe('App 集成冒烟测试', () => {
 
     const result = container.querySelector('.result')
     expect(result).not.toBeNull()
-    // 4 个字符实例的位置列表。
-    expect(result!.querySelectorAll('.positions > li').length).toBe(4)
-    // 位置严格递增。
-    const xs = Array.from(
+    // 4 个字符实例的位置列表（换行符不产生列表项）。
+    const items = Array.from(
       result!.querySelectorAll<HTMLElement>('.positions > li'),
-    ).map((li) => Number(li.textContent!.match(/x=(-?\d+)/)![1]))
-    for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1])
-    expect(xs[0]).toBe(0)
-    // canvas 已按 16× 缩放绘制。
+    )
+    expect(items.length).toBe(4)
+    // 同一行内位置严格递增；换行（含自动换行）后 x 从 0 重新开始。
+    const positions = items.map((li) => ({
+      x: Number(li.textContent!.match(/x=(-?\d+)/)![1]),
+      y: Number(li.textContent!.match(/y=(-?\d+)/)![1]),
+    }))
+    expect(positions[0]).toEqual({ x: 0, y: 0 })
+    for (let i = 1; i < positions.length; i++) {
+      if (positions[i].y === positions[i - 1].y) {
+        expect(positions[i].x).toBeGreaterThan(positions[i - 1].x)
+      } else {
+        expect(positions[i].x).toBe(0)
+      }
+    }
+    // canvas 已按 16× 缩放绘制，高度覆盖全部行（行间留一空行）。
     const canvas = result!.querySelector('canvas')!
     expect(canvas.width).toBeGreaterThan(0)
-    expect(canvas.height).toBe(8 * 16) // 页面高度 8
+    const lineCount = new Set(positions.map((p) => p.y)).size
+    expect(canvas.height).toBe((8 * lineCount + (lineCount - 1)) * 16)
 
     app.unmount()
   })

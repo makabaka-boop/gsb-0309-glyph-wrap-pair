@@ -2,38 +2,44 @@ import { describe, expect, it } from 'vitest'
 import { composeLayout, masksCollide } from '../lib/layout'
 import { rowMasks } from '../lib/glyph'
 import { generateCase, referenceLayout } from '../test/reference'
-import type { Glyph, GlyphPage } from '../lib/types'
+import type { Glyph, GlyphPage, PlacedGlyph } from '../lib/types'
 
-const KEY_YF = 64 // page.height ≤ 32，乘以 64 的全局格键无碰撞
+const KEY_XF = 4096 // gy 可达 ~2048，乘 4096 的全局格键无碰撞
 
-/** 规格级断言：位置严格递增、无黑像素重合、候选极小性、bbox/画布。 */
-function expectSpecConformance(page: GlyphPage, text: string) {
-  const result = composeLayout(page, text)
+/** 规格级断言：行内位置严格递增、无黑像素重合、候选极小性、bbox/画布。 */
+function expectSpecConformance(
+  page: GlyphPage,
+  text: string,
+  maxWidth: number = Infinity,
+) {
+  const result = composeLayout(page, text, maxWidth)
   expect(result.ok).toBe(true)
   const layout = result.layout!
-  const ref = referenceLayout(page, text)
+  const ref = referenceLayout(page, text, maxWidth)
 
-  // 与朴素逐像素参考实现完全一致。
-  expect(layout.placed.map((p) => p.x)).toEqual(
-    ref.placed.map((p) => p.x),
+  // 与朴素逐像素参考实现完全一致（含 y、换行与自动换行）。
+  expect(layout.placed.map((p) => [p.x, p.y])).toEqual(
+    ref.placed.map((p) => [p.x, p.y]),
   )
   expect(layout.bbox).toEqual(ref.bbox)
   expect(layout.canvasWidth).toBe(ref.canvasWidth)
+  expect(layout.canvasHeight).toBe(ref.canvasHeight)
 
   const byChar = new Map(page.glyphs.map((g) => [g.char, g]))
   const masksByChar = new Map(page.glyphs.map((g) => [g.char, rowMasks(g)]))
-  const xs = layout.placed.map((p) => p.x)
 
-  // 首字 x=0。
-  expect(xs[0]).toBe(0)
-
-  // 左边缘严格递增。
-  for (let i = 1; i < xs.length; i++) {
-    expect(xs[i]).toBeGreaterThan(xs[i - 1])
+  // 每行首字 x=0；同一行内左边缘严格递增。
+  for (let i = 0; i < layout.placed.length; i++) {
+    const p = layout.placed[i]
+    if (i === 0 || layout.placed[i - 1].y !== p.y) {
+      expect(p.x, `第 ${i} 个字是行首，x 必须为 0`).toBe(0)
+    } else {
+      expect(p.x).toBeGreaterThan(layout.placed[i - 1].x)
+    }
   }
 
   // 穷举所有已放黑像素到全局占用格：每个格至多出现一次，
-  // 一次遍历即覆盖“任意两字”（含隔字碰撞），无需 O(n²) 字对。
+  // 一次遍历即覆盖“任意两字”（含隔字碰撞、跨行误碰），无需 O(n²) 字对。
   const occupied = new Set<number>()
   const actualBlack: Array<[number, number]> = []
   for (const p of layout.placed) {
@@ -41,40 +47,59 @@ function expectSpecConformance(page: GlyphPage, text: string) {
     for (let r = 0; r < g.height; r++) {
       for (let c = 0; c < g.width; c++) {
         if (!g.rows[r][c]) continue
-        const key = r + (p.x + c) * KEY_YF
+        const gx = p.x + c
+        const gy = p.y + r
+        const key = gy + gx * KEY_XF
         expect(
           occupied.has(key),
-          `全局像素 (${p.x + c},${r}) 被两个字的黑像素同时占据`,
+          `全局像素 (${gx},${gy}) 被两个字的黑像素同时占据`,
         ).toBe(false)
         occupied.add(key)
-        actualBlack.push([p.x + c, r])
+        actualBlack.push([gx, gy])
       }
     }
   }
 
-  // 候选极小性：对每个 i>=1，区间 [prevX+1, x_i-1] 内的每个整数
-  // 都必须与某个已放字形黑像素碰撞（穷举偏移），不能只看相邻字。
-  for (let i = 1; i < layout.placed.length; i++) {
-    const curMasks = masksByChar.get(layout.placed[i].char)!
-    for (let x = xs[i - 1] + 1; x < xs[i]; x++) {
-      let any = false
-      for (let j = 0; j < i; j++) {
-        const otherMasks = masksByChar.get(layout.placed[j].char)!
-        if (masksCollide(otherMasks, curMasks, x - layout.placed[j].x)) {
-          any = true
-          break
-        }
-      }
-      expect(any, `x=${x} 本应发生碰撞，否则 ${xs[i]} 不是最小候选`).toBe(true)
+  // 所有字形外框必须落在行宽与画布内。
+  if (Number.isFinite(maxWidth)) {
+    for (const p of layout.placed) {
+      expect(p.x + p.width).toBeLessThanOrEqual(maxWidth)
     }
-    for (let j = 0; j < i; j++) {
-      expect(
-        masksCollide(
-          masksByChar.get(layout.placed[j].char)!,
-          curMasks,
-          xs[i] - layout.placed[j].x,
-        ),
-      ).toBe(false)
+  }
+
+  // 自动换行极小性：每个非行首字，区间 [行内 prevX+1, x_i-1] 内的每个整数
+  // 都必须与某个“同一行”已放字形黑像素碰撞，或者超出行宽（穷举偏移）。
+  const lineGroups = new Map<number, PlacedGlyph[]>()
+  for (const p of layout.placed) {
+    const list = lineGroups.get(p.y) ?? []
+    list.push(p)
+    lineGroups.set(p.y, list)
+  }
+  for (const group of lineGroups.values()) {
+    for (let i = 1; i < group.length; i++) {
+      const cur = group[i]
+      const curMasks = masksByChar.get(cur.char)!
+      for (let x = group[i - 1].x + 1; x < cur.x; x++) {
+        if (Number.isFinite(maxWidth) && x + cur.width > maxWidth) continue
+        let any = false
+        for (let j = 0; j < i; j++) {
+          const otherMasks = masksByChar.get(group[j].char)!
+          if (masksCollide(otherMasks, curMasks, x - group[j].x)) {
+            any = true
+            break
+          }
+        }
+        expect(any, `x=${x} 本应发生碰撞，否则 ${cur.x} 不是最小候选`).toBe(true)
+      }
+      for (let j = 0; j < i; j++) {
+        expect(
+          masksCollide(
+            masksByChar.get(group[j].char)!,
+            curMasks,
+            cur.x - group[j].x,
+          ),
+        ).toBe(false)
+      }
     }
   }
 
@@ -138,6 +163,134 @@ describe('composeLayout — 快速实现对拍朴素逐像素实现（随机穷�
       emptyRate: 1,
     })
     expectSpecConformance(page, text)
+  })
+})
+
+describe('composeLayout — 多行：行宽自动换行 / 手动换行 / 空行（对拍）', () => {
+  /** 在随机字串中按固定步长插入换行，覆盖首/尾/连续换行。 */
+  function withNewlines(base: string, step: number, lead = 0, trail = 0): string {
+    const parts: string[] = ['\n'.repeat(lead)]
+    for (let i = 0; i < base.length; i++) {
+      parts.push(base[i])
+      if ((i + 1) % step === 0 && i + 1 < base.length) parts.push('\n')
+    }
+    parts.push('\n'.repeat(trail))
+    return parts.join('')
+  }
+
+  const MULTI = 120
+  for (let seed = 1; seed <= MULTI; seed++) {
+    it(`multiline fuzz seed=${seed}`, () => {
+      const { page, text } = generateCase(seed, {
+        maxHeight: 6,
+        maxWidth: 12,
+        maxGlyphs: 8,
+        maxLen: 30,
+      })
+      // 行宽取 [maxGlyphW, maxGlyphW+14]，保证不会触发超宽错误。
+      const maxGlyphW = Math.max(...page.glyphs.map((g) => g.width))
+      const maxWidth = maxGlyphW + (seed % 15)
+      const step = 1 + (seed % 7)
+      const lead = seed % 3
+      const trail = (seed >> 1) % 3
+      const multi = withNewlines(text, step, lead, trail)
+      expectSpecConformance(page, multi, maxWidth)
+    })
+  }
+
+  it('仅换行（含连续换行）：没有字形、bbox EMPTY、空行仍占画布高度', () => {
+    const { page } = generateCase(42, { maxHeight: 4, maxGlyphs: 3, maxLen: 1 })
+    const r = composeLayout(page, '\n\n', 10)
+    expect(r.ok).toBe(true)
+    const layout = r.layout!
+    expect(layout.placed).toEqual([])
+    expect(layout.bbox).toBeNull()
+    expect(layout.canvasWidth).toBe(1)
+    // 2 个换行 → 3 行：3*H + 2 个行间空行。
+    expect(layout.canvasHeight).toBe(3 * page.height + 2)
+  })
+
+  it('手动换行后碰撞只比较同一行，各行 x 都从 0 起', () => {
+    const { page } = generateCase(99, { maxHeight: 3, maxWidth: 6, maxGlyphs: 4, maxLen: 1 })
+    const a = page.glyphs[0].char
+    const b = page.glyphs[1].char
+    const layout = expectSpecConformance(page, `${a}${b}\n${a}${b}`, 100)
+    expect(layout.placed.map((p) => [p.x, p.y])).toEqual([
+      [0, 0],
+      [layout.placed[1].x, 0],
+      [0, page.height + 1],
+      [layout.placed[1].x, page.height + 1],
+    ])
+    // 两行总高 = 2H + 1。
+    expect(layout.canvasHeight).toBe(page.height * 2 + 1)
+  })
+})
+
+describe('composeLayout — ABA 故障场景（宽 6 字形 + 行宽 8）', () => {
+  function glyph(char: string, rows: number[][]): Glyph {
+    return { char, width: rows[0].length, height: rows.length, rows }
+  }
+  // 两个宽 6 的字形，高 2。
+  const A = glyph('A', [
+    [1, 0, 0, 0, 0, 1],
+    [1, 1, 1, 1, 1, 1],
+  ])
+  const B = glyph('B', [
+    [1, 1, 1, 1, 1, 0],
+    [0, 0, 0, 0, 0, 1],
+  ])
+  const page: GlyphPage = { height: 2, glyphs: [A, B] }
+
+  it('每个字外框宽 6 超过行内剩余空间（行宽 8）：三字各占一行，画布不再宽 18', () => {
+    const r = composeLayout(page, 'ABA', 8)
+    expect(r.ok).toBe(true)
+    const layout = r.layout!
+    expect(layout.placed.map((p) => [p.x, p.y])).toEqual([
+      [0, 0],
+      [0, 3],
+      [0, 6],
+    ])
+    expect(layout.canvasWidth).toBe(6)
+    expect(layout.canvasHeight).toBe(8) // 3 行 * 2 + 2 空行
+    expect(layout.placed.map((p) => p.index)).toEqual([0, 1, 2])
+  })
+
+  it('单个字形宽于行宽：报 glyph-too-wide 且不产出超宽画布', () => {
+    const r = composeLayout(page, 'A', 5)
+    expect(r.ok).toBe(false)
+    expect(r.error!.kind).toBe('glyph-too-wide')
+    expect(r.error!.char).toBe('A')
+  })
+
+  it('手动换行与连续空行不再报缺失字符，空行计入画布高度', () => {
+    const r = composeLayout(page, 'A\n\nB', 8)
+    expect(r.ok).toBe(true)
+    const layout = r.layout!
+    expect(layout.placed.map((p) => [p.char, p.x, p.y])).toEqual([
+      ['A', 0, 0],
+      ['B', 0, 6],
+    ])
+    // A、空行、B → 3 行。
+    expect(layout.canvasHeight).toBe(8)
+  })
+
+  it('\\r\\n 与单独 \\r 也按换行处理', () => {
+    const r = composeLayout(page, 'A\r\nB\rA', 8)
+    expect(r.ok).toBe(true)
+    expect(r.layout!.placed.map((p) => p.y)).toEqual([0, 3, 6])
+  })
+
+  it('长字串自动换行后，位置/bbox/画布与参考实现一致', () => {
+    const layout = expectSpecConformance(page, 'ABABABAB', 8)
+    // 每字一行：8 行 → 高 8*2+7 = 23。
+    expect(layout.canvasHeight).toBe(23)
+    expect(layout.placed.every((p) => p.x === 0)).toBe(true)
+    expect(layout.bbox).toEqual({
+      minX: 0,
+      minY: 0,
+      maxX: 5,
+      maxY: 22,
+    })
   })
 })
 

@@ -50,8 +50,9 @@ const errorIssues = computed(() => error.value?.issues?.map((i) => i.message) ??
     <header class="app-header">
       <h1>Compose Glyph 离线字形排版</h1>
       <p class="subtitle">
-        像素字形按黑像素实际形状紧凑排布：空白凹口可以互相伸入，但任何两个字的黑像素绝不重合；
-        放置新字时与<em>所有</em>已放字形对撞，避免第三字撞上第一字的伸出笔画。
+        像素字形按黑像素实际形状紧凑排布：空白凹口可以互相伸入，但同一行内任何两个字的黑像素绝不重合；
+        放不下整幅字形外框时自动换到下一行，换行后从 x=0 重新开始，只与<em>同一行</em>已放字形对撞，
+        避免第三字撞上第一字的伸出笔画。
       </p>
     </header>
 
