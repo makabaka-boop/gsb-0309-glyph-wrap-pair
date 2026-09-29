@@ -56,6 +56,7 @@ export interface PositionJson {
     char: string
     x: number
     y: number
+    row: number
     width: number
     height: number
     color: string
@@ -75,6 +76,7 @@ export function layoutToJson(layout: Layout): PositionJson {
       char: p.char,
       x: p.x,
       y: p.y,
+      row: p.row,
       width: p.width,
       height: p.height,
       color: layout.palette[p.index],

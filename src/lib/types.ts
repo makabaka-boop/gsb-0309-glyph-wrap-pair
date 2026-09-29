@@ -44,6 +44,7 @@ export type ComposeErrorKind =
   | 'text-too-long'
   | 'missing-char'
   | 'invalid-page'
+  | 'glyph-too-wide'
 
 export interface ComposeError {
   kind: ComposeErrorKind
@@ -51,6 +52,9 @@ export interface ComposeError {
   char?: string
   message: string
   issues?: PageIssue[]
+  /** kind === 'glyph-too-wide'：过宽字形的外框宽度与当前行宽。 */
+  width?: number
+  maxWidth?: number
 }
 
 export interface BBox {
@@ -62,13 +66,15 @@ export interface BBox {
 }
 
 export interface PlacedGlyph {
-  /** 在输入串中的序号（从 0 开始），也是标色来源。 */
+  /** 在输入串中的字形序号（从 0 开始，换行不占序号），也是标色来源。 */
   index: number
   char: string
-  /** 字形左边缘，严格大于前一字左边缘。 */
+  /** 字形左边缘；同一视觉行内严格大于前一字左边缘，新行从 0 重新开始。 */
   x: number
-  /** 字形上边缘；同高排版恒为 0。 */
+  /** 字形上边缘所在视觉行的像素原点：row * (pageHeight + 1)。 */
   y: number
+  /** 字形所属视觉行（从 0 开始）。 */
+  row: number
   width: number
   height: number
 }
@@ -77,6 +83,8 @@ export interface LegendItem {
   index: number
   char: string
   x: number
+  y: number
+  row: number
   color: string
 }
 
@@ -84,13 +92,19 @@ export interface LegendItem {
 export interface Layout {
   pageHeight: number
   text: string
-  /** 按出现顺序放置的字形。 */
+  /** 按出现顺序放置的字形（换行不产生条目）。 */
   placed: PlacedGlyph[]
   /** 全空（没有任何黑像素）时 bbox 为 null，序列化为 "EMPTY"。 */
   bbox: BBox | null
-  /** 合成图画布：y 方向固定为页面高度，x 方向为最小无碰撞延展。 */
+  /**
+   * 合成图画布：宽度为所有视觉行的最大外框宽度，
+   * 高度为 rows * pageHeight + (rows - 1)——行间留一行空白，
+   * 空行同样占用高度。
+   */
   canvasWidth: number
   canvasHeight: number
+  /** 视觉行总数（连续换行产生的空行也计数）。 */
+  rowCount: number
   /** 与 placed 等长，每字一个 #rrggbb 颜色，按 index 取色。 */
   palette: string[]
   legend: LegendItem[]

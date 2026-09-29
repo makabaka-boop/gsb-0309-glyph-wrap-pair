@@ -30,13 +30,21 @@ export function blackCells(g: Glyph): Array<[number, number]> {
 }
 
 /**
- * 朴素参考实现：完全按规格用“全局占用格集合”逐黑像素模拟。
- * - 首字 x=0；之后候选从 prevX+1 开始逐个整数；
- * - 每个候选的每个黑像素若落在任一已放字形的黑像素格上即碰撞；
- * - 空白像素不进占用集合，因此允许互相覆盖。
+ * 朴素参考实现：完全按规格用“逐行占用格集合”逐黑像素模拟（二维多行）。
+ * - 换行符 '\n'（调用前可先规范化 CRLF/CR）强制另起一行；
+ * - 行内首字 x=0；之后候选从 prevX+1 开始逐个整数；
+ * - 下一字整幅外框放进当前行会超出 maxWidth 时自动换行（行首不触发）；
+ * - 每个候选的每个黑像素若落在“同一行”任一已放字形的黑像素格上即碰撞，
+ *   换行后不与上一行字形比较；空白像素不进占用集合，允许互相覆盖。
  * 不做任何位运算优化，测试中快速实现（32 位行掩码）必须与此结果一致。
+ *
+ * maxWidth 省略/非有限时不限制行宽（仍处理强制换行）。
  */
-export function referenceLayout(page: GlyphPage, text: string) {
+export function referenceLayout(
+  page: GlyphPage,
+  text: string,
+  maxWidth?: number,
+) {
   const chars = Array.from(text)
   const byChar = new Map<string, Glyph>()
   const blacks = new Map<string, Array<[number, number]>>()
@@ -46,74 +54,107 @@ export function referenceLayout(page: GlyphPage, text: string) {
   }
 
   const placed: PlacedGlyph[] = []
-  const occupied = new Set<number>() // key = r + gx * (page.height+1) 不安全；改用大因子
-  const KEY_YF = 64 // height ≤ 32，64 保证 key 无碰撞
+  // 二维占用格集合：key = gx * KEY_XF + gy（KEY_XF 大于任何可能的 gy）。
+  const KEY_XF = 100000
+  const occupied = new Set<number>()
   let bbox: BBox | null = null
-  let prevX = -1
+  const limit =
+    maxWidth === undefined || !Number.isFinite(maxWidth) ? Infinity : maxWidth
 
-  const collides = (ch: string, x: number) => {
+  let visualRow = 0
+  let prevX = -1
+  let ordinal = 0
+  let maxCanvasX = 0
+
+  const collides = (ch: string, x: number, y: number) => {
     for (const [r, c] of blacks.get(ch)!) {
-      if (occupied.has(r + (x + c) * KEY_YF)) return true
+      if (occupied.has((x + c) * KEY_XF + (y + r))) return true
     }
     return false
   }
 
+  const newline = () => {
+    visualRow += 1
+    prevX = -1
+  }
+
   for (let i = 0; i < chars.length; i++) {
     const ch = chars[i]
+    if (ch === '\n') {
+      newline()
+      continue
+    }
     const g = byChar.get(ch)!
+
+    // 求当前行最早“无碰撞且整幅外框不超行宽”的位置；
+    // 行首为 0，否则从 prevX+1 起逐个枚举，找不到可容纳候选则换行。
     let x: number
-    if (i === 0) {
+    let yy = visualRow * (page.height + 1)
+    if (prevX < 0) {
       x = 0
     } else {
       x = prevX + 1
-      while (collides(ch, x)) x++
+      while (x + g.width <= limit && collides(ch, x, yy)) x++
+      if (x + g.width > limit) {
+        newline()
+        x = 0
+        yy = visualRow * (page.height + 1)
+      }
     }
     placed.push({
-      index: i,
+      index: ordinal,
       char: ch,
       x,
-      y: 0,
+      y: yy,
+      row: visualRow,
       width: g.width,
       height: g.height,
     })
     for (const [r, c] of blacks.get(ch)!) {
-      occupied.add(r + (x + c) * KEY_YF)
       const gx = x + c
+      const gy = yy + r
+      occupied.add(gx * KEY_XF + gy)
       if (!bbox) {
-        bbox = { minX: gx, minY: r, maxX: gx, maxY: r }
+        bbox = { minX: gx, minY: gy, maxX: gx, maxY: gy }
       } else {
         if (gx < bbox.minX) bbox.minX = gx
         if (gx > bbox.maxX) bbox.maxX = gx
-        if (r < bbox.minY) bbox.minY = r
-        if (r > bbox.maxY) bbox.maxY = r
+        if (gy < bbox.minY) bbox.minY = gy
+        if (gy > bbox.maxY) bbox.maxY = gy
       }
     }
     prevX = x
+    ordinal++
+    maxCanvasX = Math.max(maxCanvasX, x + g.width)
   }
 
+  const rowCount = visualRow + 1
   return {
     placed,
     bbox,
-    canvasWidth: Math.max(1, ...placed.map((p) => p.x + p.width)),
+    canvasWidth: Math.max(1, maxCanvasX),
+    canvasHeight: rowCount * page.height + (rowCount - 1),
+    rowCount,
   }
 }
 
 /**
  * 最终占用格 → 归属字实例序号。规格要求黑像素两两不重合，
  * 因此每个格至多一个属主；若出现第二个属主即为规格违反。
+ * 键含全局 y：不同视觉行的黑像素互不碰撞，不能共用只按 x 编码的键。
  */
 export function ownerMap(
   page: GlyphPage,
   placed: PlacedGlyph[],
 ): { owners: Map<number, number>; duplicates: number } {
-  const KEY_YF = 64
+  const KEY_XF = 100000
   const owners = new Map<number, number>()
   const byChar = new Map(page.glyphs.map((g) => [g.char, g]))
   let duplicates = 0
   for (const p of placed) {
     const g = byChar.get(p.char)!
     for (const [r, c] of blackCells(g)) {
-      const key = r + (p.x + c) * KEY_YF
+      const key = (p.x + c) * KEY_XF + (p.y + r)
       if (owners.has(key)) duplicates++
       owners.set(key, p.index)
     }

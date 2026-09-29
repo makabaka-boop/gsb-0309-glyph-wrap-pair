@@ -81,19 +81,40 @@ function fail(error: ComposeError): ComposeResult {
   return { ok: false, error }
 }
 
+/** 行宽下界/上界（与 ComposerPanel 的输入范围保持一致）。 */
+export const MIN_MAX_WIDTH = 8
+export const MAX_MAX_WIDTH = 128
+
 /**
- * 离线排版入口。
+ * 统一换行符：CRLF 与 CR 都按 LF 处理。换行语义基于规范化后的字串，
+ * 保证码点计数、UI 展示与排版内部一致（一个换行占一个码点、不占字形序号）。
+ */
+export function normalizeNewlines(text: string): string {
+  return text.replace(/\r\n?/g, '\n')
+}
+
+/**
+ * 离线排版入口（二维多行）。
  *
  * 规则：
- * 1. 首字左边缘 x=0；之后每字左边缘必须严格大于前一字左边缘，
+ * 1. 每行从 x=0 开始；行内首字 x=0，之后每字左边缘必须严格大于前一字左边缘，
  *    从 prevX+1 开始逐个整数候选；
- * 2. 候选 x 必须不与“任何已放字形”的黑像素重合（不只是相邻两字）；
+ * 2. 候选 x 必须不与“同一视觉行内任何已放字形”的黑像素重合（不只是相邻两字）；
  * 3. 空白像素允许互相覆盖，所以只比较黑像素；
- * 4. 缺失字符或页面/位图非法时返回错误，调用方据此撤销旧排版；
- * 5. 全空合成图 bbox=null（对外记为 EMPTY）。
+ * 4. 下一字整幅外框放进当前行会超出 maxWidth 时换到下一行（行间留一行空白）；
+ * 5. 输入中的 '\n' 是强制换行（本身不要字形、不进位置列表），连续换行保留空行；
+ * 6. 某字外框比行宽还宽时返回 glyph-too-wide 错误，调用方据此撤销旧排版；
+ * 7. 缺失字符或页面/位图非法时返回错误；全空合成图 bbox=null（对外记为 EMPTY）。
+ *
+ * maxWidth 省略或非有限值时不限制行宽（单行排版，保持旧调用兼容）。
  */
-export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number): ComposeResult {
-  const codePoints = Array.from(text)
+export function composeLayout(
+  page: GlyphPage,
+  text: string,
+  maxWidth?: number,
+): ComposeResult {
+  const normalized = normalizeNewlines(text)
+  const codePoints = Array.from(normalized)
 
   if (codePoints.length === 0) {
     return fail({ kind: 'empty-text', message: '请输入要排版的字串' })
@@ -115,7 +136,9 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
   }
 
   const prepared = prepare(page)
+  // 换行符不对应字形，跳过。
   for (const ch of codePoints) {
+    if (ch === '\n') continue
     if (!prepared.has(ch)) {
       return fail({
         kind: 'missing-char',
@@ -125,25 +148,63 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
     }
   }
 
+  // 行宽限制（有限值）；单字外框比行宽还宽时无法排版，直接报错。
+  const limit =
+    maxWidth === undefined || !Number.isFinite(maxWidth) ? Infinity : maxWidth
+  if (Number.isFinite(limit)) {
+    for (const ch of new Set(codePoints)) {
+      if (ch === '\n') continue
+      const w = prepared.get(ch)!.glyph.width
+      if (w > limit) {
+        return fail({
+          kind: 'glyph-too-wide',
+          char: ch,
+          width: w,
+          maxWidth: limit,
+          message: `字符 "${ch}" 的字形宽 ${w} 超过每行最大宽度 ${limit}，无法换行容纳，已保留编辑并撤销旧排版`,
+        })
+      }
+    }
+  }
+
   const placed: PlacedGlyph[] = []
   let bbox: BBox | null = null
+  // 当前视觉行的状态：已放字形（只与同行字形碰撞）与行内上一字左边缘。
+  let linePlaced: PlacedGlyph[] = []
   let prevX = -1
+  let visualRow = 0
+  let ordinal = 0 // 字形出现序号（换行不计数），即来源颜色下标。
+  let maxCanvasX = 0
+
+  // 另起一新视觉行（强制换行或超宽自动换行）。空行也照常推进行号。
+  const startNewLine = () => {
+    visualRow += 1
+    linePlaced = []
+    prevX = -1
+  }
 
   for (let i = 0; i < codePoints.length; i++) {
     const ch = codePoints[i]
+    if (ch === '\n') {
+      startNewLine()
+      continue
+    }
     const item = prepared.get(ch)!
-    let x: number
-    if (i === 0) {
-      x = 0
-    } else {
-      // 候选从 prevX+1 起，一定满足“左边缘严格大于前一字左边缘”。
+
+    // 求本字在当前行的最早无碰撞位置（行首为 0；否则从 prevX+1 起枚举）。
+    let x = 0
+    if (linePlaced.length > 0) {
+      // 在不超过行宽的候选区间内枚举：从 prevX+1 起（左边缘严格递增），
+      // 取第一个“不与同行任何已放字形碰撞且整幅外框不超行宽”的整数。
+      // 碰撞可能把所有可容纳位置都占掉：此时找不到候选，必须换行。
       let candidate = prevX + 1
-      for (;;) {
+      let found = false
+      while (candidate + item.glyph.width <= limit) {
         let collision = false
-        // 与所有已放字形比较，防止隔字碰撞。
-        for (let j = 0; j < placed.length; j++) {
-          const other = prepared.get(placed[j].char)!
-          const dx = candidate - placed[j].x
+        // 换行后碰撞只比较同一行的字形，防止隔字碰撞。
+        for (let j = 0; j < linePlaced.length; j++) {
+          const other = prepared.get(linePlaced[j].char)!
+          const dx = candidate - linePlaced[j].x
           if (masksCollide(other.masks, item.masks, dx)) {
             collision = true
             break
@@ -151,60 +212,74 @@ export function composeLayout(page: GlyphPage, text: string, _maxWidth?: number)
         }
         if (!collision) {
           x = candidate
+          found = true
           break
         }
         candidate++
       }
+      if (!found) {
+        startNewLine()
+        x = 0
+      }
     }
 
-    placed.push({
-      index: i,
+    const y = visualRow * (page.height + 1)
+    const p: PlacedGlyph = {
+      index: ordinal,
       char: ch,
       x,
-      y: 0,
+      y,
+      row: visualRow,
       width: item.glyph.width,
       height: item.glyph.height,
-    })
+    }
+    placed.push(p)
+    linePlaced.push(p)
+    prevX = x
+    ordinal++
+    maxCanvasX = Math.max(maxCanvasX, x + item.glyph.width)
 
     if (item.colSpan && item.rowSpan) {
       const gMinX = x + item.colSpan.min
       const gMaxX = x + item.colSpan.max
+      const gMinY = y + item.rowSpan.min
+      const gMaxY = y + item.rowSpan.max
       if (bbox === null) {
-        bbox = {
-          minX: gMinX,
-          minY: item.rowSpan.min,
-          maxX: gMaxX,
-          maxY: item.rowSpan.max,
-        }
+        bbox = { minX: gMinX, minY: gMinY, maxX: gMaxX, maxY: gMaxY }
       } else {
         bbox.minX = Math.min(bbox.minX, gMinX)
         bbox.maxX = Math.max(bbox.maxX, gMaxX)
-        bbox.minY = Math.min(bbox.minY, item.rowSpan.min)
-        bbox.maxY = Math.max(bbox.maxY, item.rowSpan.max)
+        bbox.minY = Math.min(bbox.minY, gMinY)
+        bbox.maxY = Math.max(bbox.maxY, gMaxY)
       }
     }
-    prevX = x
   }
 
-  // 画布覆盖所有已放字形（含空白部分），保证导出图与布局位置一致。
-  const canvasWidth = Math.max(
-    1,
-    ...placed.map((p) => p.x + p.width),
-  )
+  // 视觉行总数：取自动换行与强制换行实际推进到的行（含前导/连续/末尾
+  // 换行产生的空行，它们也会把 visualRow 推到对应行号）。
+  const rowCount = visualRow + 1
+
+  // 画布覆盖所有已放字形（含空白部分）与所有视觉行（含空行高度），
+  // 保证导出图与布局位置一致。
+  const canvasWidth = Math.max(1, maxCanvasX)
+  const canvasHeight = rowCount * page.height + (rowCount - 1)
 
   const palette = buildPalette(placed.length)
   const layout: Layout = {
     pageHeight: page.height,
-    text,
+    text: normalized,
     placed,
     bbox,
     canvasWidth,
-    canvasHeight: page.height,
+    canvasHeight,
+    rowCount,
     palette,
     legend: placed.map((p) => ({
       index: p.index,
       char: p.char,
       x: p.x,
+      y: p.y,
+      row: p.row,
       color: palette[p.index],
     })),
   }

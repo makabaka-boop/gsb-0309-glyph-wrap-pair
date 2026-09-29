@@ -165,4 +165,58 @@ describe('导出：PNG / JSON 同源与逐像素正确', () => {
     const raster2 = rasterize(snap.layout, rowsMap)
     expect(Array.from(raster2.data)).toEqual(Array.from(snap.raster.data))
   })
+
+  it('多行：位置 JSON（含 row/y）与 PNG 同源，行间空白行全白', async () => {
+    // 页高 2、1 宽字形；行宽 2：前两个 1 宽字可同行（不碰撞），
+    // 第三个字因行宽自动折到下一行，'\n' 再强制空出一行。
+    const narrow: GlyphPage = {
+      height: 2,
+      glyphs: [
+        { char: 'A', width: 1, height: 2, rows: [[1], [0]] },
+        { char: 'B', width: 1, height: 2, rows: [[0], [1]] },
+      ],
+    }
+    const r = composeLayout(narrow, 'AB\n\nA', 2)
+    expect(r.ok).toBe(true)
+    const rowsMap = new Map(narrow.glyphs.map((g) => [g.char, g.rows]))
+    const snap = buildExportSnapshot(r.layout!, rowsMap)
+    const json = layoutToJson(snap.layout)
+
+    // 视觉行：行0 A@0,B@1；'\n' → 行1（空）；'\n' → 行2 A@0。共 3 行。
+    expect(json.positions.map((p) => [p.char, p.x, p.y, p.row])).toEqual([
+      ['A', 0, 0, 0],
+      ['B', 1, 0, 0],
+      ['A', 0, 6, 2],
+    ])
+    expect(json.canvas).toEqual({ width: 2, height: 8 }) // 3 行 *2 + 2 空白行
+
+    const decoded = await decodePng(await encodePng(snap.raster))
+    expect(decoded.width).toBe(2)
+    expect(decoded.height).toBe(8)
+    const px = (x: number, y: number) => {
+      const o = (y * 2 + x) * 4
+      return [decoded.data[o], decoded.data[o + 1], decoded.data[o + 2]]
+    }
+    const white: [number, number, number] = [255, 255, 255]
+    const hex = (h: string): [number, number, number] => [
+      parseInt(h.slice(1, 3), 16),
+      parseInt(h.slice(3, 5), 16),
+      parseInt(h.slice(5, 7), 16),
+    ]
+    // 行0：y0 左 A 黑右白；y1 左白右 B 黑。
+    expect(px(0, 0)).toEqual(hex(json.positions[0].color))
+    expect(px(1, 0)).toEqual(white)
+    expect(px(0, 1)).toEqual(white)
+    expect(px(1, 1)).toEqual(hex(json.positions[1].color))
+    // 间隔行 y=2、强制空行 y=3,4、行2 间隔 y=5 全部为白。
+    for (let y = 2; y <= 5; y++) {
+      expect(px(0, y)).toEqual(white)
+      expect(px(1, y)).toEqual(white)
+    }
+    // 行2：y6 左 A 黑，y7 全白。
+    expect(px(0, 6)).toEqual(hex(json.positions[2].color))
+    expect(px(1, 6)).toEqual(white)
+    expect(px(0, 7)).toEqual(white)
+    expect(px(1, 7)).toEqual(white)
+  })
 })

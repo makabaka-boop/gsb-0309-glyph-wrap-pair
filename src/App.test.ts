@@ -19,18 +19,22 @@ describe('App 集成冒烟测试', () => {
 
     const result = container.querySelector('.result')
     expect(result).not.toBeNull()
-    // 4 个字符实例的位置列表。
+    // 4 个字符实例的位置列表（换行不产生条目）。
     expect(result!.querySelectorAll('.positions > li').length).toBe(4)
-    // 位置严格递增。
+    // 每个视觉行内 x 从 0 开始且严格递增。默认页 A 宽 7、B 宽 5、行宽 16：
+    // A 与 B 不碰撞且外框 7+5=12≤16 → AB 同行（x=0,7）；下一个 A 起每行放不下。
+    const ys = Array.from(
+      result!.querySelectorAll<HTMLElement>('.positions > li'),
+    ).map((li) => Number(li.textContent!.match(/y=(-?\d+)/)![1]))
     const xs = Array.from(
       result!.querySelectorAll<HTMLElement>('.positions > li'),
     ).map((li) => Number(li.textContent!.match(/x=(-?\d+)/)![1]))
-    for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1])
-    expect(xs[0]).toBe(0)
-    // canvas 已按 16× 缩放绘制。
+    expect(xs).toEqual([0, 7, 0, 7])
+    expect(ys).toEqual([0, 0, 9, 9]) // 行0 两字，行1 两字
+    // canvas 已按 16× 缩放绘制：2 视觉行 + 1 空白行 = 17 高。
     const canvas = result!.querySelector('canvas')!
     expect(canvas.width).toBeGreaterThan(0)
-    expect(canvas.height).toBe(8 * 16) // 页面高度 8
+    expect(canvas.height).toBe(17 * 16)
 
     app.unmount()
   })

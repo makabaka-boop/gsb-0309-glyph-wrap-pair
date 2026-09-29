@@ -54,9 +54,9 @@ async function doExport() {
     <h2>排版</h2>
 
     <label class="text-label">
-      输入字串
+      输入字串（换行 = 强制换行，连续换行保留空行）
       <textarea
-        rows="2"
+        rows="3"
         :value="text"
         spellcheck="false"
         @input="emit('update:text', ($event.target as HTMLTextAreaElement).value)"
@@ -92,12 +92,15 @@ async function doExport() {
     </ul>
 
     <div v-if="snapshot" class="result">
-      <p class="bbox">最小包围盒：{{ bboxText }}</p>
-      <p class="positions-title">各字形位置（严格递增 x）：</p>
+      <p class="bbox">
+        最小包围盒：{{ bboxText }}　画布 {{ snapshot.layout.canvasWidth }}×{{ snapshot.layout.canvasHeight }}
+        （{{ snapshot.layout.rowCount }} 行）
+      </p>
+      <p class="positions-title">各字形位置（同一行内 x 严格递增，新行从 x=0 起）：</p>
       <ol class="positions">
         <li v-for="p in snapshot.layout.placed" :key="p.index">
           <span class="swatch" :style="{ background: snapshot.layout.palette[p.index] }" />
-          #{{ p.index }} “{{ p.char }}” → x={{ p.x }}, y={{ p.y }}
+          #{{ p.index }} “{{ p.char }}” → 行 {{ p.row }}, x={{ p.x }}, y={{ p.y }}
           （外框 {{ p.width }}×{{ p.height }}）
         </li>
       </ol>

@@ -64,4 +64,29 @@ describe('composeLayout 错误处理', () => {
     expect(r.error!.kind).toBe('invalid-page')
     expect(r.error!.issues!.length).toBeGreaterThan(0)
   })
+
+  it('单字外框宽于行宽报 glyph-too-wide（换行也无法容纳）', () => {
+    const r = composeLayout(page, 'AB', 1)
+    expect(r.ok).toBe(false)
+    expect(r.error!.kind).toBe('glyph-too-wide')
+    expect(r.error!.width).toBe(2)
+    expect(r.error!.maxWidth).toBe(1)
+  })
+
+  it('换行符不需要字形，含手动换行的字串不报 missing-char', () => {
+    const r = composeLayout(page, 'A\nB')
+    expect(r.ok).toBe(true)
+    expect(r.layout!.placed).toHaveLength(2)
+    expect(r.layout!.rowCount).toBe(2)
+  })
+
+  it('只有换行的字串是合法排版（空行画布），不是 empty-text', () => {
+    const r = composeLayout(page, '\n\n')
+    expect(r.ok).toBe(true)
+    expect(r.layout!.placed).toHaveLength(0)
+    expect(r.layout!.rowCount).toBe(3)
+    expect(r.layout!.bbox).toBeNull()
+    expect(r.layout!.canvasWidth).toBe(1)
+    expect(r.layout!.canvasHeight).toBe(3 * 2 + 2) // 8：3 行高 + 2 空白间隔行
+  })
 })
